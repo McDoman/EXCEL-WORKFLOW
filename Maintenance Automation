@@ -1,0 +1,294 @@
+# -*- coding: utf-8 -*-
+"""
+Spyder Editor
+
+Consolidate BU submissions into a master Excel template.
+Handles headers on row 1–3, bloated used ranges, and colors sheet tabs red if data was written.
+"""
+
+import re
+import argparse
+from pathlib import Path
+from typing import Dict, List, Tuple, Optional
+from openpyxl import load_workbook
+
+
+def normalize(val) -> str:
+    """Normalize header text for matching (case/space-insensitive)."""
+    if val is None:
+        return ""
+    s = str(val).replace("\n", " ").strip().lower()
+    s = re.sub(r"\s+", " ", s)
+    return s
+
+
+def find_header_in_master(ws, search_rows: int = 5, max_scan_cols: int = 200) -> Tuple[int, List[str], List[str]]:
+    """
+    Detect the header row in the master sheet by looking at the first few rows
+    and picking the row with the most non-empty cells where column A is non-empty.
+    Returns (header_row_index, header_display_names, header_norm_names).
+    """
+    max_count = -1
+    header_row = 1
+    header_vals: List[Optional[str]] = []
+
+    max_row = min(search_rows, ws.max_row or 1)
+    max_col = min(ws.max_column or 1, max_scan_cols)
+
+    for r in range(1, max_row + 1):
+        row_cells = [ws.cell(r, c).value for c in range(1, max_col + 1)]
+        non_empty_cols = [i for i, v in enumerate(row_cells, start=1) if v not in (None, "")]
+        count = len(non_empty_cols)
+        if ws.cell(r, 1).value not in (None, "") and count >= 2 and count > max_count:
+            max_count = count
+            last_col = non_empty_cols[-1] if non_empty_cols else 1
+            header_row = r
+            header_vals = row_cells[:last_col]
+
+    if not header_vals:
+        # Fallback to row 1
+        header_row = 1
+        header_vals = [ws.cell(1, c).value for c in range(1, max_col + 1)]
+        # trim trailing empties
+        while header_vals and (header_vals[-1] is None or str(header_vals[-1]).strip() == ""):
+            header_vals.pop()
+
+    header_display = [v if v is not None else "" for v in header_vals]
+    header_norm = [normalize(v) for v in header_display]
+    return header_row, header_display, header_norm
+
+
+def get_master_sheet_meta(wb) -> Dict[str, Dict]:
+    """
+    Build a metadata dictionary for each sheet in the master:
+    header row index, display headers, normalized headers, number of columns.
+    """
+    meta: Dict[str, Dict] = {}
+    for sheet_name in wb.sheetnames:
+        ws = wb[sheet_name]
+        h_row, h_disp, h_norm = find_header_in_master(ws, search_rows=5, max_scan_cols=200)
+        meta[sheet_name] = {
+            "header_row": h_row,
+            "header_display": h_disp,
+            "header_norm": h_norm,
+            "ncols": len(h_norm),
+        }
+    return meta
+
+
+def find_header_row_and_colmap(
+    ws_sub,
+    master_headers_norm: List[str],
+    search_rows: int = 5,
+    max_scan_cols: int = None
+) -> Tuple[int, Dict[str, Optional[int]], int]:
+    """
+    Find the row in the submission that looks like the header by matching
+    as many master header names as possible (within the first search_rows).
+    Caps scanned columns for speed.
+    Returns (header_row_index_in_sub, colmap, score).
+    """
+    if max_scan_cols is None:
+        max_scan_cols = max(50, len(master_headers_norm) + 25)  # adjust if needed
+
+    max_cols = min(ws_sub.max_column or 1, max_scan_cols)
+    max_rows = min(search_rows, ws_sub.max_row or 1)
+
+    master_set = set(master_headers_norm)
+    best_row = 1
+    best_score = -1
+    best_map: Dict[str, int] = {}
+
+    for r in range(1, max_rows + 1):
+        row_map: Dict[str, int] = {}
+        seen = set()
+        for c in range(1, max_cols + 1):
+            h = normalize(ws_sub.cell(r, c).value)
+            if h and h in master_set and h not in seen:
+                row_map[h] = c
+                seen.add(h)
+        score = len(row_map)
+        if score > best_score:
+            best_score = score
+            best_row = r
+            best_map = row_map
+        if score == len(master_headers_norm):
+            break  # perfect match
+
+    colmap = {m: best_map.get(m) for m in master_headers_norm}
+    return best_row, colmap, best_score
+
+
+def read_rows_from_sub(
+    ws_sub,
+    header_row_sub: int,
+    colmap: Dict[str, Optional[int]],
+    master_header_norms: List[str],
+    empty_row_break: int = 200,
+    progress_every: int = 2000
+) -> List[List]:
+    """
+    Stream rows below the header and stop after many consecutive empty rows,
+    avoiding iterating to Excel's max row when the used range is bloated.
+    """
+    rows: List[List] = []
+    mapped_cols = [colmap.get(m) for m in master_header_norms]
+    present_cols = [c for c in mapped_cols if c is not None]
+    if not present_cols:
+        return rows
+
+    minc, maxc = min(present_cols), max(present_cols)
+    start_r = header_row_sub + 1
+
+    empty_run = 0
+    processed = 0
+    for ridx, row_vals_slice in enumerate(
+        ws_sub.iter_rows(min_row=start_r, min_col=minc, max_col=maxc, values_only=True),
+        start=start_r
+    ):
+        # Rebuild the row in the master’s column order
+        row_vals = [(row_vals_slice[c - minc] if c is not None else None) for c in mapped_cols]
+
+        # Check empty row
+        if all(v in (None, "") for v in row_vals):
+            empty_run += 1
+            # If we've already seen some data, bail after a run of empties
+            if empty_run >= empty_row_break and len(rows) > 0:
+                break
+        else:
+            empty_run = 0
+            rows.append(row_vals)
+
+        processed += 1
+        if progress_every and processed % progress_every == 0:
+            print(f"    ... processed {processed} rows for this sheet")
+
+    return rows
+
+
+def write_rows_to_master(ws_master, header_row_master: int, rows: List[List], ncols: int):
+    """
+    Write rows to the master sheet starting below the header row.
+    Clears previous data in the first ncols columns before writing.
+    """
+    # Clear prior data (if any) in data area
+    start_row = header_row_master + 1
+    if ws_master.max_row >= start_row:
+        for r in range(start_row, ws_master.max_row + 1):
+            for c in range(1, ncols + 1):
+                ws_master.cell(row=r, column=c, value=None)
+
+    # Write new data
+    for i, row in enumerate(rows):
+        target_row = start_row + i
+        for j, val in enumerate(row[:ncols], start=1):
+            ws_master.cell(row=target_row, column=j, value=val)
+
+
+def consolidate_folder(master_template_path: str, submissions_folder_path: str, output_path: str, verbose: bool = True):
+    """
+    Consolidate all .xlsx files in submissions_folder_path into a copy of master_template_path,
+    writing results to output_path.
+    """
+    master_template = Path(master_template_path)
+    submissions_folder = Path(submissions_folder_path)
+    output = Path(output_path)
+
+    if not master_template.exists():
+        raise FileNotFoundError(f"Master template not found: {master_template}")
+    if not submissions_folder.exists():
+        raise FileNotFoundError(f"Submissions folder not found: {submissions_folder}")
+
+    # Load master once (preserve formatting, titles, etc.)
+    wb_out = load_workbook(str(master_template))
+    sheet_meta = get_master_sheet_meta(wb_out)
+
+    # Gather rows per sheet across all submissions
+    aggregated: Dict[str, List[List]] = {s: [] for s in wb_out.sheetnames}
+
+    files = sorted([p for p in submissions_folder.glob("*.xlsx") if not p.name.startswith("~$")])
+    if verbose:
+        print(f"Found {len(files)} files in {submissions_folder}")
+
+    for f in files:
+        print(f"Processing file: {f.name}")
+        try:
+            wb_sub = load_workbook(str(f), data_only=True, read_only=True)
+        except Exception as e:
+            print(f"ERROR: Cannot open {f.name}: {e}")
+            continue
+
+        for sheet_name in wb_out.sheetnames:
+            print(f"  Sheet: {sheet_name}")
+            if sheet_name not in wb_sub.sheetnames:
+                print(f"  WARNING: {f.name} missing sheet '{sheet_name}'")
+                continue
+
+            ws_sub = wb_sub[sheet_name]
+            # Diagnostics to understand sheet size (helps catch bloated used range)
+            if verbose:
+                try:
+                    dim = ws_sub.calculate_dimension()
+                except Exception:
+                    dim = "<unknown>"
+                print(f"    dimension={dim}, max_row={ws_sub.max_row}, max_col={ws_sub.max_column}")
+
+            master_norms = sheet_meta[sheet_name]["header_norm"]
+
+            # Map headers in the submission sheet to the master's header order
+            header_row_sub, colmap, score = find_header_row_and_colmap(ws_sub, master_norms, search_rows=5, max_scan_cols=200)
+            if score < max(1, len(master_norms) // 2):
+                print(f"  WARNING: Low header match on '{sheet_name}' in {f.name} -> matched {score}/{len(master_norms)}")
+
+            rows = read_rows_from_sub(ws_sub, header_row_sub, colmap, master_norms, empty_row_break=200, progress_every=2000)
+            if verbose:
+                print(f"  {f.name} -> {sheet_name}: {len(rows)} rows")
+            aggregated[sheet_name].extend(rows)
+
+        # Best effort close (read_only workbook)
+        try:
+            wb_sub.close()
+        except Exception:
+            pass
+
+    # Write into a copy of the master
+    for sheet_name, rows in aggregated.items():
+        ws = wb_out[sheet_name]
+        header_row_master = sheet_meta[sheet_name]["header_row"]
+        ncols = sheet_meta[sheet_name]["ncols"]
+
+        write_rows_to_master(ws, header_row_master, rows, ncols)
+
+        # Color sheet tab red if any data was written
+        if len(rows) > 0:
+            ws.sheet_properties.tabColor = "FF0000"
+        else:
+            ws.sheet_properties.tabColor = None
+
+    output.parent.mkdir(parents=True, exist_ok=True)
+    wb_out.save(str(output))
+
+    print("\nConsolidation complete:", output)
+    for sheet_name in wb_out.sheetnames:
+        print(f" - {sheet_name}: {len(aggregated[sheet_name])} rows{' [RED]' if len(aggregated[sheet_name])>0 else ''}")
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Consolidate BU submissions into a master Excel template.")
+    parser.add_argument("--master", required=True, help="Path to the empty master template .xlsx (for this template)")
+    parser.add_argument("--in", dest="input_folder", required=True, help="Path to the submissions folder (e.g., Private or Public)")
+    parser.add_argument("--out", dest="output_file", required=True, help="Path for the compiled master output .xlsx")
+
+    args = parser.parse_args()
+    consolidate_folder(args.master, args.input_folder, args.output_file, verbose=True)
+
+
+if __name__ == "__main__":
+    # Direct call with your paths (handy for Spyder)
+    consolidate_folder(
+        master_template_path=r"C:\Users\WHITESYSTEM\Desktop\MSc. PROJECT WORK\script test\OCTOBER 2025 Private DT Maintenance IEGIS008.xlsx",
+        submissions_folder_path=r"C:\Users\WHITESYSTEM\Desktop\MSc. PROJECT WORK\script test\PRIVATE",
+        output_path=r"C:\Users\WHITESYSTEM\Desktop\MSc. PROJECT WORK\script test\MASTER OCTOBER 2025 Private DT Maintenance IEGIS008.xlsx",
+        verbose=True
+    )
+    
